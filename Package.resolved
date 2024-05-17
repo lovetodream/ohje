@@ -1,6 +1,15 @@
 {
-  "originHash" : "8122c5498be09d09070cc2ffd699f326e55232b7d057aa898ae4ed9b41a1e898",
+  "originHash" : "4cc7921c968b3ecd4fec63d26aaec01dd8f32da1578c95f88db405b7788e1957",
   "pins" : [
+    {
+      "identity" : "package-histogram",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/ordo-one/package-histogram.git",
+      "state" : {
+        "revision" : "a69fa24d7b70421870cafa86340ece900489e17e",
+        "version" : "0.1.2"
+      }
+    },
     {
       "identity" : "swift-argument-parser",
       "kind" : "remoteSourceControl",
@@ -44,6 +53,15 @@
       "state" : {
         "revision" : "c6afe04165c865faaa687b42c32ed76dfcc91076",
         "version" : "1.31.0"
+      }
+    },
+    {
+      "identity" : "swift-numerics",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-numerics.git",
+      "state" : {
+        "revision" : "0a5bc04095a675662cf24757cc0640aa2204253b",
+        "version" : "1.0.2"
       }
     },
     {
