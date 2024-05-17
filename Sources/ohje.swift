@@ -33,7 +33,7 @@ struct App: AsyncParsableCommand {
     // TODO: http2 support
 
     func run() async throws {
-        let (scheme, target, uri) = try deconstructURL(url) // TODO: handle scheme
+        let (scheme, target, uri) = try deconstructURL(url) // TODO: handle tls
 
         let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: threads)
 
