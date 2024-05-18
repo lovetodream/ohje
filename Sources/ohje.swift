@@ -77,7 +77,7 @@ struct App: AsyncParsableCommand {
         try await ClientBootstrap(group: eventLoopGroup)
             .connectTimeout(.seconds(timeout))
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .channelOption(ChannelOptions.socketOption(.tcp_nodelay), value: 1)
+            .channelOption(ChannelOptions.tcpOption(.tcp_nodelay), value: 1)
             .connect(target: target) { channel in
                 channel.eventLoop.makeCompletedFuture {
                     try channel.pipeline.syncOperations.addHTTPClientHandlers()
@@ -113,7 +113,7 @@ struct App: AsyncParsableCommand {
 
     func runConstantThroughput(target: ConnectionTarget, head: HTTPRequestHead) async {
         let throughputPerConnection = throughput / concurrency
-        
+
         @Sendable func tick() async {
             await withDiscardingTaskGroup { connectionGroup in
                 for _ in 0..<concurrency {
