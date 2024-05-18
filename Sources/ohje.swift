@@ -54,6 +54,7 @@ struct App: AsyncParsableCommand {
                             var initialDone = false
                             let clientChannel = try await ClientBootstrap(group: eventLoopGroup)
                                 .connectTimeout(.seconds(timeout))
+                                .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
                                 .connect(target: target) { channel in
                                     channel.eventLoop.makeCompletedFuture {
                                         try channel.pipeline.syncOperations.addHTTPClientHandlers()
