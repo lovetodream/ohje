@@ -1,15 +1,6 @@
 import ArgumentParser
-import Atomics
-import NIOCore
-import NIOConcurrencyHelpers
 import NIOPosix
-import NIOHTTP1
-import NIOHTTP2
-import NIOSSL
 import Histogram
-#if canImport(Network)
-import NIOTransportServices
-#endif
 
 @main
 struct App: AsyncParsableCommand, Arguments {
@@ -43,13 +34,14 @@ struct App: AsyncParsableCommand, Arguments {
     """, transform: parseRange(_:))
     var connectionReuse: Range<Int>?
 
+    @Flag
+    var http2: Bool = false
+
     @Argument
     var url: String
 
     @Argument(help: "Saves a HdrHistogram (.hgrm) file to the specified location. This file can be inspected using a HdrHistogram Plotter.", completion: .directory)
     var out: String?
-
-    // TODO: http2 support
 
     mutating func run() async throws {
         let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: threads)
@@ -65,7 +57,6 @@ struct App: AsyncParsableCommand, Arguments {
             clock: clock,
             start: start,
             end: end,
-            now: { clock.now },
             on: eventLoopGroup
         )
         let result = try await runner.run()
