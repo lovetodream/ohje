@@ -1,7 +1,5 @@
 import struct Foundation.URL
 import struct Foundation.URLComponents
-import NIOCore
-import NIOPosix
 
 extension URL {
     var percentEncodedPath: String {
@@ -93,21 +91,5 @@ func deconstructURL(_ url: String) throws /* (URLDeconstructionError) */ -> (Sch
             throw URLDeconstructionError.missingSocketPath
         }
         return (scheme, .unixSocket(path: socketPath), url.uri)
-    }
-}
-
-extension ClientBootstrap {
-    func connect<Output: Sendable>(
-        target: ConnectionTarget, 
-        channelInitializer: @escaping @Sendable (Channel) -> EventLoopFuture<Output>
-    ) async throws -> Output {
-        switch target {
-        case .ipAddress(_, let socketAddress):
-            return try await self.connect(to: socketAddress, channelInitializer: channelInitializer)
-        case .domain(let domain, let port):
-            return try await self.connect(host: domain, port: port, channelInitializer: channelInitializer)
-        case .unixSocket(let path):
-            return try await self.connect(unixDomainSocketPath: path, channelInitializer: channelInitializer)
-        }
     }
 }

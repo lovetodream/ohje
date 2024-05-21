@@ -6,6 +6,9 @@ import NIOPosix
 import NIOHTTP1
 import NIOHTTP2
 import Histogram
+#if canImport(Network)
+import NIOTransportServices
+#endif
 
 @main
 struct App: AsyncParsableCommand {
@@ -21,7 +24,7 @@ struct App: AsyncParsableCommand {
     @Option(name: .long, help: "The tcp timeout before a connection attempt gets aborted.")
     var timeout: Int64 = 30
 
-    @Option(name: .short, help: "The duration of the benchmark in seconds.")
+    @Option(name: .shortAndLong, help: "The duration of the benchmark in seconds.")
     var duration: Int = 10
 
     @Argument
@@ -35,6 +38,7 @@ struct App: AsyncParsableCommand {
     }
 
     // TODO: http2 support
+    // TODO: connection reuse range
 
     typealias Clock = ContinuousClock
 
@@ -43,7 +47,9 @@ struct App: AsyncParsableCommand {
     private let errors = ManagedAtomic(Int64(0))
     private let histogram = NIOLockedValueBox(Histogram<UInt64>(highestTrackableValue: 60_000_000)) // max: 1 min in usec
     
+
     private var eventLoopGroup: (any EventLoopGroup)!
+    private var _bootstrap: (any ConnectionTargetBootstrap)!
     private var start: Clock.Instant!
     private var end: Clock.Instant!
 
@@ -51,6 +57,7 @@ struct App: AsyncParsableCommand {
         let (_ /* scheme */, target, uri) = try deconstructURL(url) // TODO: handle tls
 
         eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: threads)
+        _bootstrap = makeBootstrap()
 
         print("Running \(duration)s benchmark @ \(url)")
         print("  \(threads) threads and \(concurrency) connections")
@@ -71,20 +78,6 @@ struct App: AsyncParsableCommand {
         try await eventLoopGroup.shutdownGracefully()
 
         try await printResults()
-    }
-
-    func makeHTTP1Channel(target: ConnectionTarget) async throws -> NIOAsyncChannel<HTTPClientResponsePart, HTTPPart<HTTPRequestHead, ByteBuffer>> {
-        try await ClientBootstrap(group: eventLoopGroup)
-            .connectTimeout(.seconds(timeout))
-            .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .channelOption(ChannelOptions.tcpOption(.tcp_nodelay), value: 1)
-            .connect(target: target) { channel in
-                channel.eventLoop.makeCompletedFuture {
-                    try channel.pipeline.syncOperations.addHTTPClientHandlers()
-                    try channel.pipeline.syncOperations.addHandler(HTTPByteBufferResponsePartHandler())
-                    return try NIOAsyncChannel<HTTPClientResponsePart, HTTPPart<HTTPRequestHead, ByteBuffer>>(wrappingChannelSynchronously: channel)
-                }
-            }
     }
 
     func runConstantConcurrency(target: ConnectionTarget, head: HTTPRequestHead, group: inout DiscardingTaskGroup) {
@@ -216,7 +209,48 @@ struct App: AsyncParsableCommand {
             }
         }
     }
+}
 
+
+// MARK: Channels
+
+extension App {
+
+    func makeHTTP1Channel(target: ConnectionTarget) async throws -> NIOAsyncChannel<HTTPClientResponsePart, HTTPPart<HTTPRequestHead, ByteBuffer>> {
+        try await _bootstrap.connect(target: target) { channel in
+                channel.eventLoop.makeCompletedFuture {
+                    try channel.pipeline.syncOperations.addHTTPClientHandlers()
+                    try channel.pipeline.syncOperations.addHandler(HTTPByteBufferResponsePartHandler())
+                    return try NIOAsyncChannel(wrappingChannelSynchronously: channel)
+                }
+            }
+    }
+
+    func makeBootstrap() -> any ConnectionTargetBootstrap {
+        #if canImport(Network)
+        if let tsBootstrap = NIOTSConnectionBootstrap(validatingGroup: eventLoopGroup) {
+            return tsBootstrap
+                .connectTimeout(.seconds(timeout))
+                .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+                .channelOption(ChannelOptions.tcpOption(.tcp_nodelay), value: 1)
+        }
+        #endif
+
+        guard let bootstrap = ClientBootstrap(validatingGroup: eventLoopGroup) else {
+            fatalError("No matching bootstrap found")
+        }
+
+        return bootstrap
+            .connectTimeout(.seconds(timeout))
+            .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+            .channelOption(ChannelOptions.tcpOption(.tcp_nodelay), value: 1)
+    }
+}
+
+
+// MARK: Utility
+
+extension App {
     final class HTTPByteBufferResponsePartHandler: ChannelOutboundHandler {
         typealias OutboundIn = HTTPPart<HTTPRequestHead, ByteBuffer>
         typealias OutboundOut = HTTPClientRequestPart
