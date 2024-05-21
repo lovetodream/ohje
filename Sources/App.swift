@@ -27,18 +27,32 @@ struct App: AsyncParsableCommand {
     @Option(name: .shortAndLong, help: "The duration of the benchmark in seconds.")
     var duration: Int = 10
 
+    @Option(name: .long, help: """
+    Indicates how many requests are executed on a single TCP connection before a new connection is created. 
+    Can be specified as a range or an exact value. If not specified, connections are reused for [throughput/concurrency] \
+    or indefinitely if thoughput is 0.
+
+    Examples:
+      - 0..<100 : connections will be reused between 0 and 99 times.
+      - 10...50 : connections will be reused between 10 and 50 times.
+      - 20      : connections will be reused exactly 20 times.
+      - 1...    : connections will be reused at least once.
+      - ...20   : connections will be reused up to 20 times.
+      - ..<10   : connections will be reused up to 9 times.
+    """, transform: parseRange(_:))
+    var connectionReuse: Range<Int>?
+
     @Argument
     var url: String
 
-    @Argument(help: "Saves a HdrHistogram (.hgrm) file to the specified location. This file can be inspected using a HdrHistogram Plotter.")
+    @Argument(help: "Saves a HdrHistogram (.hgrm) file to the specified location. This file can be inspected using a HdrHistogram Plotter.", completion: .directory)
     var out: String?
 
     enum CodingKeys: CodingKey {
-        case threads, concurrency, throughput, timeout, duration, url, out
+        case threads, concurrency, throughput, timeout, duration, connectionReuse, url, out
     }
 
     // TODO: http2 support
-    // TODO: connection reuse range
 
     typealias Clock = ContinuousClock
 
@@ -46,7 +60,6 @@ struct App: AsyncParsableCommand {
     private let total = ManagedAtomic(Int64(0))
     private let errors = ManagedAtomic(Int64(0))
     private let histogram = NIOLockedValueBox(Histogram<UInt64>(highestTrackableValue: 60_000_000)) // max: 1 min in usec
-    
 
     private var eventLoopGroup: (any EventLoopGroup)!
     private var _bootstrap: (any ConnectionTargetBootstrap)!
@@ -90,10 +103,13 @@ struct App: AsyncParsableCommand {
 
                     try await clientChannel.executeThenClose { inbound, outbound in
                         var iterator = inbound.makeAsyncIterator()
-                        loop: while end > .now {
+                        let reuse = connectionReuse?.randomElement()
+                        var executed = 0
+                        while reuse != nil ? executed <= reuse! && end > .now : end > .now {
                             let start = initialDone ? clock.now : initialStart
                             try await executeRequest(start: start, head: head, outbound: outbound, inboundIterator: &iterator)
                             initialDone = true
+                            executed += 1
                         }
                     }
                 } catch {
@@ -113,20 +129,29 @@ struct App: AsyncParsableCommand {
                     connectionGroup.addTask {
                         var actualThroughput = 0
                         do {
-                            let channel = try await makeHTTP1Channel(target: target)
-                            try await channel.executeThenClose { inbound, outbound in
-                                var iterator = inbound.makeAsyncIterator()
-                                for _ in 0..<throughputPerConnection {
-                                    do {
-                                        try await executeRequest(start: .now, head: head, outbound: outbound, inboundIterator: &iterator)
-                                        actualThroughput += 1
-                                    } catch is CancellationError {
-                                        throw CancellationError()
-                                    } catch {
-                                        print(error)
-                                        errors.wrappingIncrement(ordering: .relaxed)
+                            func runConnection() async throws {
+                                let channel = try await makeHTTP1Channel(target: target)
+                                try await channel.executeThenClose { inbound, outbound in
+                                    var iterator = inbound.makeAsyncIterator()
+                                    for _ in 0..<(connectionReuse?.randomElement() ?? throughputPerConnection) {
+                                        if actualThroughput >= throughputPerConnection {
+                                            throw CancellationError()
+                                        }
+                                        do {
+                                            try await executeRequest(start: .now, head: head, outbound: outbound, inboundIterator: &iterator)
+                                            actualThroughput += 1
+                                        } catch is CancellationError {
+                                            throw CancellationError()
+                                        } catch {
+                                            print(error)
+                                            errors.wrappingIncrement(ordering: .relaxed)
+                                        }
                                     }
                                 }
+                            }
+
+                            while actualThroughput < throughputPerConnection {
+                                try await runConnection()
                             }
                         } catch is CancellationError {
                             return

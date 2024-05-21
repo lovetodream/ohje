@@ -22,7 +22,11 @@ let package = Package(
                 .product(name: "NIOHTTP2", package: "swift-nio-http2"),
                 .product(name: "NIOTransportServices", package: "swift-nio-transport-services"),
                 .product(name: "Histogram", package: "package-histogram")
+            ],
+            swiftSettings: [
+                .enableUpcomingFeature("BareSlashRegexLiterals"),
             ]
         ),
+        .testTarget(name: "OhjeTests", dependencies: ["Ohje"])
     ]
 )
