@@ -62,3 +62,12 @@ extension ConnectionTarget {
         }
     }
 }
+
+extension ConnectionTarget {
+    var sslServerHostname: String? {
+        switch self {
+        case .domain(let domain, _): return domain
+        case .ipAddress, .unixSocket: return nil
+        }
+    }
+}

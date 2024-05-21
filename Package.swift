@@ -9,6 +9,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.0.0"),
         .package(url: "https://github.com/apple/swift-nio-http2.git", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-nio-transport-services.git", from: "1.19.0"),
+        .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.25.0"),
         .package(url: "https://github.com/ordo-one/package-histogram.git", from: "0.1.0"),
     ],
     targets: [
@@ -21,6 +22,7 @@ let package = Package(
                 .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOHTTP2", package: "swift-nio-http2"),
                 .product(name: "NIOTransportServices", package: "swift-nio-transport-services"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl"),
                 .product(name: "Histogram", package: "package-histogram")
             ],
             swiftSettings: [
