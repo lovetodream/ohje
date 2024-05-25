@@ -21,10 +21,17 @@ protocol Arguments {
 
 struct BenchmarkResult {
     let duration: Duration
-    let total: Int64
-    let errors: Int64
+    let total: UInt64
+    let connectErrors: UInt64
+    let readErrors: UInt64
+    let writeErrors: UInt64
+    let timeoutErrors: UInt64
+    let httpResponseErrors: UInt64
+    let bytesWritten: UInt64
+    let bytesRead: UInt64
     let throughput: Double
-    let histogram: Histogram<UInt64>
+    let latency: Histogram<UInt64>
+    let requests: Histogram<UInt64>
 }
 
 struct BenchmarkRunner<Clock: _Concurrency.Clock> where Clock.Duration == Duration {
@@ -32,9 +39,17 @@ struct BenchmarkRunner<Clock: _Concurrency.Clock> where Clock.Duration == Durati
     private let target: ConnectionTarget
     private let uri: String
 
-    private let total = ManagedAtomic(Int64(0))
-    private let errors = ManagedAtomic(Int64(0))
-    private let histogram = NIOLockedValueBox(Histogram<UInt64>(highestTrackableValue: 60_000_000)) // max: 1 min in usec
+    private let total = ManagedAtomic(UInt64(0))
+    private let currentRequests = ManagedAtomic(UInt64(0))
+    private let connectErrors = ManagedAtomic(UInt64(0))
+    private let readErrors = ManagedAtomic(UInt64(0))
+    private let writeErrors = ManagedAtomic(UInt64(0))
+    private let timeoutErrors = ManagedAtomic(UInt64(0))
+    private let httpResponseErrors = ManagedAtomic(UInt64(0))
+    private let bytesWritten: ManagedAtomic<UInt64>
+    private let bytesRead: ManagedAtomic<UInt64>
+    private let latency = NIOLockedValueBox(Histogram<UInt64>(highestTrackableValue: 60_000_000)) // max: 1 min in usec
+    private let requests = NIOLockedValueBox(Histogram<UInt64>(numberOfSignificantValueDigits: .three))
 
     private let clock: Clock
     private let start: Clock.Instant
@@ -78,7 +93,13 @@ struct BenchmarkRunner<Clock: _Concurrency.Clock> where Clock.Duration == Durati
         }
         self.sslContext = sslContext
 
-        self.bootstrap = Self.makeBootstrap(timeout: args.timeout, on: eventLoopGroup)
+        let bytesWritten = ManagedAtomic(UInt64(0))
+        let bytesRead = ManagedAtomic(UInt64(0))
+        self.bytesWritten = bytesWritten
+        self.bytesRead = bytesRead
+        self.bootstrap = Self.makeBootstrap(timeout: args.timeout, on: eventLoopGroup, handlers: {
+            [WireReader(bytesWritten: bytesWritten, bytesRead: bytesRead)]
+        })
     }
 
     func shutdown() async throws {
@@ -87,11 +108,20 @@ struct BenchmarkRunner<Clock: _Concurrency.Clock> where Clock.Duration == Durati
 
     func run() async throws -> BenchmarkResult {
         let head = HTTPRequestHead(version: args.http2 ? .http2 : .http1_1, method: .GET, uri: uri, headers: ["Host": target.host ?? ""])
-        while end > clock.now {
-            if args.throughput != 0 {
-                await runConstantThroughput(head: head)
-            } else {
-                await runConstantConcurrency(head: head)
+        await withDiscardingTaskGroup { group in
+            group.addTask {
+                var start = clock.now
+                for await _ /* tick */ in AsyncTimerSequence.repeating(every: .seconds(1), clock: clock) {
+                    sampleRate(start: &start)
+                }
+            }
+
+            while end > clock.now {
+                if args.throughput != 0 {
+                    await runConstantThroughput(head: head, group: &group)
+                } else {
+                    await runConstantConcurrency(head: head, group: &group)
+                }
             }
         }
 
@@ -100,9 +130,16 @@ struct BenchmarkRunner<Clock: _Concurrency.Clock> where Clock.Duration == Durati
         return BenchmarkResult(
             duration: duration,
             total: total,
-            errors: errors.load(ordering: .relaxed),
+            connectErrors: connectErrors.load(ordering: .relaxed),
+            readErrors: readErrors.load(ordering: .relaxed),
+            writeErrors: writeErrors.load(ordering: .relaxed),
+            timeoutErrors: timeoutErrors.load(ordering: .relaxed),
+            httpResponseErrors: httpResponseErrors.load(ordering: .relaxed),
+            bytesWritten: bytesWritten.load(ordering: .relaxed),
+            bytesRead: bytesRead.load(ordering: .relaxed),
             throughput: Double(total) / Double(duration.components.seconds),
-            histogram: histogram.withLockedValue({ $0 })
+            latency: latency.withLockedValue({ $0 }),
+            requests: requests.withLockedValue({ $0 })
         )
     }
 
@@ -117,18 +154,61 @@ struct BenchmarkRunner<Clock: _Concurrency.Clock> where Clock.Duration == Durati
         while let packet = try await inboundIterator.next() {
             switch packet {
             case .head(let head):
-                if head.status.code / 100 != 2 {
+                let status = head.status.code / 100
+                if status != 2 && status != 3 {
                     throw HTTPResponseError()
                 }
             case .body: continue
             case .end:
-                let duration = start.duration(to: clock.now)
-                let durationInMicro = UInt64(duration.components.attoseconds / 1_000_000_000_000) + UInt64(duration.components.seconds) * 1_000_000
-                histogram.withLockedValue { _ = $0.record(durationInMicro) }
-                total.wrappingIncrement(ordering: .relaxed)
+                let duration = start.duration(to: clock.now).asMicroseconds()
+                latency.withLockedValue { _ = $0.record(duration) }
+                currentRequests.wrappingIncrement(ordering: .relaxed)
                 return
             }
         }
+    }
+
+    struct ErrorHandled: Error { }
+    enum ErrorHandling {
+        case rethrow(as: any Error)
+        case `continue`
+    }
+    @discardableResult
+    private func handleError(_ error: any Error) -> ErrorHandling {
+        if error is HTTPResponseError {
+            httpResponseErrors.wrappingIncrement(ordering: .relaxed)
+            readErrors.wrappingIncrement(ordering: .relaxed)
+            return .continue
+        } else if let error = error as? ChannelError {
+            switch error {
+            case .connectPending, .unknownLocalAddress, .badMulticastGroupAddressFamily, .badInterfaceAddressFamily, .illegalMulticastAddress, .multicastNotSupported, .operationUnsupported, .inappropriateOperationForState, .unremovableHandler:
+                connectErrors.wrappingIncrement(ordering: .relaxed)
+            case .connectTimeout:
+                timeoutErrors.wrappingIncrement(ordering: .relaxed)
+            case .ioOnClosedChannel, .alreadyClosed, .outputClosed, .writeMessageTooLarge, .writeHostUnreachable:
+                writeErrors.wrappingIncrement(ordering: .relaxed)
+            case .inputClosed, .eof:
+                readErrors.wrappingIncrement(ordering: .relaxed)
+            }
+            return .rethrow(as: ErrorHandled())
+        } else if let error = error as? NIOAsyncWriterError {
+            if error == .alreadyFinished() {
+                writeErrors.wrappingIncrement(ordering: .relaxed)
+            }
+            return .rethrow(as: ErrorHandled())
+        } else {
+            fatalError("TODO: handle me: \(error)")
+        }
+    }
+
+    private func sampleRate(start: inout Clock.Instant) {
+        let elapsedTime = start.duration(to: clock.now)
+        let elapsedMilliseconds = elapsedTime.components.seconds * 1000 + elapsedTime.components.attoseconds / 1_000_000_000_000_000
+        start = clock.now
+        let rawRequests = currentRequests.exchange(0, ordering: .relaxed)
+        let requests = (Double(rawRequests) / Double(elapsedMilliseconds)) * 1000.0
+        total.wrappingIncrement(by: rawRequests, ordering: .relaxed)
+        self.requests.withLockedValue { _ = $0.record(UInt64(requests)) }
     }
 }
 
@@ -137,41 +217,37 @@ struct BenchmarkRunner<Clock: _Concurrency.Clock> where Clock.Duration == Durati
 
 extension BenchmarkRunner {
 
-    private func runConstantConcurrency(head: HTTPRequestHead) async {
+    private func runConstantConcurrency(head: HTTPRequestHead, group: inout DiscardingTaskGroup) async {
         if args.http2 {
             do {
                 try await runConstantConcurrency_HTTP2(head: head)
             } catch {
-                print(error)
-                errors.wrappingIncrement(ordering: .relaxed)
+                handleError(error)
             }
             return
         }
 
-        await withDiscardingTaskGroup { group in
-            for _ in 0..<args.concurrency { // burst
-                group.addTask {
-                    do {
-                        let initialStart = clock.now
-                        var initialDone = false
+        for _ in 0..<args.concurrency { // burst
+            group.addTask {
+                do {
+                    let initialStart = clock.now
+                    var initialDone = false
 
-                        let clientChannel = try await makeHTTP1Channel()
+                    let clientChannel = try await makeHTTP1Channel()
 
-                        try await clientChannel.executeThenClose { inbound, outbound in
-                            var iterator = inbound.makeAsyncIterator()
-                            let reuse = args.connectionReuse?.randomElement()
-                            var executed = 0
-                            while reuse != nil ? executed <= reuse! && end > clock.now : end > clock.now {
-                                let start = initialDone ? clock.now : initialStart
-                                try await executeRequest(start: start, head: head, outbound: outbound, inboundIterator: &iterator)
-                                initialDone = true
-                                executed += 1
-                            }
+                    try await clientChannel.executeThenClose { inbound, outbound in
+                        var iterator = inbound.makeAsyncIterator()
+                        let reuse = args.connectionReuse?.randomElement()
+                        var executed = 0
+                        while reuse != nil ? executed <= reuse! && end > clock.now : end > clock.now {
+                            let start = initialDone ? clock.now : initialStart
+                            try await executeRequest(start: start, head: head, outbound: outbound, inboundIterator: &iterator)
+                            initialDone = true
+                            executed += 1
                         }
-                    } catch {
-                        print(error)
-                        errors.wrappingIncrement(ordering: .relaxed)
                     }
+                } catch {
+                    handleError(error)
                 }
             }
         }
@@ -205,7 +281,7 @@ extension BenchmarkRunner {
 
 extension BenchmarkRunner {
 
-    private func runConstantThroughput(head: HTTPRequestHead) async {
+    private func runConstantThroughput(head: HTTPRequestHead, group: inout DiscardingTaskGroup) async {
         let throughputPerConnection = args.throughput / args.concurrency
 
         @Sendable func tick() async {
@@ -216,19 +292,17 @@ extension BenchmarkRunner {
             }
         }
 
-        await withDiscardingTaskGroup { group in
-            group.addTask {
-                await tick()
+        group.addTask {
+            await tick()
+        }
+
+        for await _ /* tick */ in AsyncTimerSequence(interval: .seconds(1), clock: clock) {
+            if clock.now > end {
+                group.cancelAll()
+                return
             }
 
-            for await _ /* tick */ in AsyncTimerSequence(interval: .seconds(1), clock: clock) {
-                if clock.now > end {
-                    group.cancelAll()
-                    return
-                }
-
-                group.addTask { await tick() }
-            }
+            group.addTask { await tick() }
         }
     }
 
@@ -252,8 +326,12 @@ extension BenchmarkRunner {
                                     } catch is CancellationError {
                                         throw CancellationError() // cascade
                                     } catch {
-                                        print(error)
-                                        errors.wrappingIncrement(ordering: .relaxed)
+                                        switch handleError(error) {
+                                        case .continue:
+                                            continue
+                                        case .rethrow(as: let new):
+                                            throw new
+                                        }
                                     }
                                 }
                             }
@@ -264,9 +342,10 @@ extension BenchmarkRunner {
                         }
                     } catch is CancellationError {
                         return
+                    } catch is ErrorHandled {
+                        return
                     } catch {
-                        print(error)
-                        errors.wrappingIncrement(ordering: .relaxed)
+                        handleError(error)
                     }
                 }
             }
@@ -279,8 +358,7 @@ extension BenchmarkRunner {
             do {
                 channel = try await makeHTTP2Channel()
             } catch {
-                print(error)
-                errors.wrappingIncrement(ordering: .relaxed)
+                handleError(error)
                 return
             }
 
@@ -310,8 +388,12 @@ extension BenchmarkRunner {
                                         } catch is CancellationError {
                                             throw CancellationError() // cascade
                                         } catch {
-                                            print(error)
-                                            errors.wrappingIncrement(ordering: .relaxed)
+                                            switch handleError(error) {
+                                            case .continue:
+                                                continue
+                                            case .rethrow(as: let new):
+                                                throw new
+                                            }
                                         }
                                     }
                                 }
@@ -319,9 +401,10 @@ extension BenchmarkRunner {
                         }
                     } catch is CancellationError {
                         return
+                    } catch is ErrorHandled {
+                        return
                     } catch {
-                        print(error)
-                        errors.wrappingIncrement(ordering: .relaxed)
+                        handleError(error)
                     }
                 }
             }
@@ -371,13 +454,18 @@ extension BenchmarkRunner {
         }
     }
 
-    private static func makeBootstrap(timeout: Int64, on eventLoopGroup: any EventLoopGroup) -> any ConnectionTargetBootstrap {
+    private static func makeBootstrap(
+        timeout: Int64,
+        on eventLoopGroup: any EventLoopGroup,
+        handlers: @escaping @Sendable () -> [any ChannelHandler]
+    ) -> any ConnectionTargetBootstrap {
         #if canImport(Network)
         if let tsBootstrap = NIOTSConnectionBootstrap(validatingGroup: eventLoopGroup) {
             return tsBootstrap
                 .connectTimeout(.seconds(timeout))
                 .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
                 .channelOption(ChannelOptions.tcpOption(.tcp_nodelay), value: 1)
+                .protocolHandlers(handlers)
         }
         #endif
 
@@ -389,6 +477,7 @@ extension BenchmarkRunner {
             .connectTimeout(.seconds(timeout))
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .channelOption(ChannelOptions.tcpOption(.tcp_nodelay), value: 1)
+            .protocolHandlers(handlers)
     }
 }
 
@@ -396,6 +485,31 @@ extension BenchmarkRunner {
 // MARK: Utility
 
 extension BenchmarkRunner {
+    private final class WireReader: ChannelDuplexHandler {
+        typealias InboundIn = ByteBuffer
+        typealias OutboundIn = ByteBuffer
+
+        private let bytesWritten: ManagedAtomic<UInt64>
+        private let bytesRead: ManagedAtomic<UInt64>
+
+        init(bytesWritten: ManagedAtomic<UInt64>, bytesRead: ManagedAtomic<UInt64>) {
+            self.bytesWritten = bytesWritten
+            self.bytesRead = bytesRead
+        }
+
+        func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+            context.fireChannelRead(data)
+            let bytes = unwrapInboundIn(data).readableBytes
+            bytesRead.wrappingIncrement(by: UInt64(bytes), ordering: .relaxed)
+        }
+
+        func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+            context.write(data, promise: promise)
+            let bytes = unwrapOutboundIn(data).readableBytes
+            bytesWritten.wrappingIncrement(by: UInt64(bytes), ordering: .relaxed)
+        }
+    }
+
     private final class HTTPByteBufferResponsePartHandler: ChannelOutboundHandler {
         typealias OutboundIn = HTTPPart<HTTPRequestHead, ByteBuffer>
         typealias OutboundOut = HTTPClientRequestPart

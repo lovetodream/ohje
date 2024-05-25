@@ -66,24 +66,39 @@ struct App: AsyncParsableCommand, Arguments {
     }
 
     func printResults(_ result: BenchmarkResult) async throws {
-        print("\nBenchmark results:")
-        print("Total duration: \(result.duration) (target duration: \(duration)s)")
-        print("Total requests: \(result.total)")
-        print("Errors: \(result.errors)")
-        if throughput != 0 {
-            print("Throughput: \(result.throughput) (target throughput: \(throughput))")
-        } else {
-            print("Throughput: \(result.throughput)")
+        print("  \(UnitFormat.metric.format(result.total)) requests in \(UnitFormat.microseconds.format(result.duration.asMicroseconds())), \(UnitFormat.binary.format(result.bytesRead)) read")
+        if result.connectErrors != 0 || result.readErrors != 0 || result.writeErrors != 0 || result.timeoutErrors != 0 {
+            print("""
+              Socket errors: connect \(UnitFormat.metric.format(result.connectErrors)), \
+            read \(UnitFormat.metric.format(result.readErrors)), \
+            write \(UnitFormat.metric.format(result.writeErrors)), \
+            timeout \(UnitFormat.metric.format(result.timeoutErrors))
+            """)
         }
+        print("  Thread Stats   Avg      Stdev     Max   +/- Stdev")
+        printThreadStats(name: "Latency", histogram: result.latency, unit: .microseconds)
+        printThreadStats(name: "Req/Sec", histogram: result.requests, unit: .metric)
+        if result.httpResponseErrors != 0 {
+            print("  Non-2xx or 3xx responses: \(UnitFormat.metric.format(result.httpResponseErrors))")
+        }
+        let actualThroughput = "Requests/sec: \(format(result.throughput, using: .metric, width: 9))"
+        if throughput != 0 {
+            print("\(actualThroughput) (target: \(UnitFormat.metric.format(throughput)))")
+        } else {
+            print(actualThroughput)
+        }
+        let bytesThroughput = Double(result.bytesWritten + result.bytesRead) / Double(result.total)
+        print("Transfer/sec: \(format(bytesThroughput, using: .binary, width: 9))")
+        print("")
         print("Percentile  | Count     | Value")
         print("------------+-----------+-------------")
         let percentiles = [ 0.0, 50.0, 80.0, 95.0, 99.0, 99.9, 99.99, 99.999, 100.0 ]
-        let finalHistogram = result.histogram
+        let finalHistogram = result.latency
         let firstValue = finalHistogram.valueAtPercentile(0.0)
         for p in percentiles {
             let value = finalHistogram.valueAtPercentile(p)
             let count = finalHistogram.count(within: firstValue...value)
-            print("\(String(format: "%-08.3f", p))    | \(String(format: "%-09d", count)) | \(Double(value) / 1000000)s")
+            print("\(String(format: "%-08.3f", p))    | \(String(format: "%-09d", count)) | \(format(Double(value), using: .microseconds))")
         }
 
         if let out {
@@ -91,5 +106,32 @@ struct App: AsyncParsableCommand, Arguments {
             finalHistogram.write(to: &buffer)
             try await buffer.persist(to: out)
         }
+    }
+
+    func printThreadStats(name: String, histogram: Histogram<some BinaryInteger>, unit: UnitFormat) {
+        func stdev() -> Double {
+            let mean = histogram.mean
+            let stdev = histogram.stdDeviation
+            let upper = mean + stdev
+            var lower = mean - stdev
+            if lower < 0 {
+                lower = 0
+            }
+
+            let totalCount = histogram.totalCount
+            if totalCount == 0 {
+                return 0.0
+            }
+
+            let upperCount = histogram.count(within: 0...UInt64(upper))
+            let lowerCount = histogram.count(within: 0...UInt64(lower))
+            return 100.0 * Double(upperCount - lowerCount) / Double(totalCount)
+        }
+
+        print("    \(name)", terminator: "   ")
+        print(format(histogram.mean, using: unit, width: 8), terminator: "")
+        print(format(histogram.stdDeviation, using: unit, width: 10), terminator: "")
+        print(format(Double(histogram.max), using: unit, width: 9), terminator: "")
+        print(String(format: "%8.2Lf%%", stdev()))
     }
 }
