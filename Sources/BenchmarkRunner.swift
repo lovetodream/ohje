@@ -113,6 +113,7 @@ struct BenchmarkRunner<Clock: _Concurrency.Clock> where Clock.Duration == Durati
                 var start = clock.now
                 for await _ /* tick */ in AsyncTimerSequence.repeating(every: .seconds(1), clock: clock) {
                     sampleRate(start: &start)
+                    if clock.now > end { return }
                 }
             }
 
